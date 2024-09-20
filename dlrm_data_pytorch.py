@@ -323,6 +323,11 @@ class CriteoDataset(Dataset):
 
 
 def collate_wrapper_criteo_offset(list_of_tuples):
+    """
+    X_int: numerical dense feature
+    X_cat: categorical sparse feature
+    y: target (label)
+    """
     # where each tuple is (X_int, X_cat, y)
     transposed_data = list(zip(*list_of_tuples))
     X_int = torch.log(torch.tensor(transposed_data[0], dtype=torch.float) + 1)
@@ -332,6 +337,10 @@ def collate_wrapper_criteo_offset(list_of_tuples):
     batchSize = X_cat.shape[0]
     featureCnt = X_cat.shape[1]
 
+    """
+    lS_i (index?) is a list of tensors. Each tensor correponds to a feature (there are in total featureCnt features). Each tensor has batchSize elements, indicating the feature value for each sample in the batch.
+    lS_o (offset?) is a matrix, with featureCnt * batchSize shape, and each row is a sequential list from 0 to batchSize. TODO: what is the usage of this?
+    """
     lS_i = [X_cat[:, i] for i in range(featureCnt)]
     lS_o = [torch.tensor(range(batchSize)) for _ in range(featureCnt)]
 

@@ -85,7 +85,7 @@ import torch.nn as nn
 
 # dataloader
 try:
-    from internals import fbDataLoader, fbInputBatchFormatter
+    from internals import fbDataLoader, fbInputBatchFormatter # type: ignore
 
     has_internal_libs = True
 except ImportError:
@@ -248,6 +248,7 @@ class DLRM_Net(nn.Module):
     def create_emb(self, m, ln, weighted_pooling=None):
         emb_l = nn.ModuleList()
         v_W_l = []
+        # ln.size represents number of embedding tables, i.e. number of features
         for i in range(0, ln.size):
             if ext_dist.my_size > 1:
                 if i not in self.local_emb_indices:
@@ -487,8 +488,10 @@ class DLRM_Net(nn.Module):
         if self.arch_interaction_op == "dot":
             # concatenate dense and sparse features
             (batch_size, d) = x.shape
+            # Size of T: (batch_size, feature_num, d)
             T = torch.cat([x] + ly, dim=1).view((batch_size, -1, d))
             # perform a dot product
+            # torch.transpose transposes the tensor on dimension 1 and 2, and the size of the transposed tensor T is (batch_size, d, feature_num)
             Z = torch.bmm(T, torch.transpose(T, 1, 2))
             # append dense feature with the interactions (into a row vector)
             # approach 1: all
@@ -500,10 +503,12 @@ class DLRM_Net(nn.Module):
             # li, lj = torch.tril_indices(ni, nj, offset=offset)
             # approach 2: custom
             offset = 1 if self.arch_interaction_itself else 0
+            # extract the lower triangular part of the interaction matrix. offset is used to skip the diagonal elements, which means the interaction of a feature with itself.
             li = torch.tensor([i for i in range(ni) for j in range(i + offset)])
             lj = torch.tensor([j for i in range(nj) for j in range(i + offset)])
             Zflat = Z[:, li, lj]
             # concatenate dense features and interactions
+            # after cat, each expanded dim (from Zflat) represents the interaction correspondence of two features
             R = torch.cat([x] + [Zflat], dim=1)
         elif self.arch_interaction_op == "cat":
             # concatenation features (into a row vector)
@@ -1382,6 +1387,7 @@ def run():
     # training or inference
     best_acc_test = 0
     best_auc_test = 0
+    # skip some start epochs. The model training might be paused early on, and we can resume the model training from that epoch
     skip_upto_epoch = 0
     skip_upto_batch = 0
     total_time = 0
@@ -1519,6 +1525,7 @@ def run():
         if not args.inference_only:
             k = 0
             total_time_begin = 0
+            # Main loop
             while k < args.nepochs:
                 if args.mlperf_logging:
                     mlperf_logger.barrier()
