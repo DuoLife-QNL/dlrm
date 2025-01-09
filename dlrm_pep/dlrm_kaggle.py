@@ -374,10 +374,13 @@ def batched(it: Iterator, n: int):
 def _train(
     pipeline: TrainPipelineSparseDist,
     train_dataloader: DataLoader,
+    val_dataloader: DataLoader,
     epoch: int,
     lr_scheduler,
     print_lr: bool,
+    validation_freq: Optional[int],
     limit_train_batches: Optional[int],
+    limit_val_batches: Optional[int],
 ) -> None:
     """
     Trains model for 1 epoch. Helper function for train_val_test.
@@ -385,10 +388,13 @@ def _train(
     Args:
         pipeline (TrainPipelineSparseDist): data pipeline.
         train_dataloader (DataLoader): Training set's dataloader.
+        val_dataloader (DataLoader): Validation set's dataloader.
         epoch (int): The number of complete passes through the training set so far.
         lr_scheduler (LRPolicyScheduler): Learning rate scheduler.
         print_lr (bool): Whether to print the learning rate every training step.
+        validation_freq (Optional[int]): The number of training steps between validation runs within an epoch.
         limit_train_batches (Optional[int]): Limits the training set to the first `limit_train_batches` batches.
+        limit_val_batches (Optional[int]): Limits the validation set to the first `limit_val_batches` batches.
 
     Returns:
         None.
@@ -408,7 +414,9 @@ def _train(
 
     start_it = 0
     n = (
-        limit_train_batches if limit_train_batches else len(train_dataloader)
+        validation_freq
+        if validation_freq
+        else limit_train_batches if limit_train_batches else len(train_dataloader)
     )
     for batched_iterator in batched(iterator, n):
         for it in itertools.count(start_it):
@@ -426,22 +434,27 @@ def _train(
                 start_it = it
                 break
 
+        if validation_freq and start_it % validation_freq == 0:
+            _evaluate(limit_val_batches, pipeline, val_dataloader, "val")
+            pipeline._model.train()
 
 @dataclass
-class TrainTestResults:
+class TrainValTestResults:
+    val_aurocs: List[float] = field(default_factory=list)
     test_auroc: Optional[float] = None
 
-def train_test(
+def train_val_test(
     args: argparse.Namespace,
     model: torch.nn.Module,
     optimizer: torch.optim.Optimizer,
     device: torch.device,
     train_dataloader: DataLoader,
+    val_dataloader: DataLoader,
     test_dataloader: DataLoader,
     lr_scheduler: LRPolicyScheduler,
-) -> TrainTestResults:
+) -> TrainValTestResults:
     """
-    Train/test loop.
+    Train/validation/test loop.
 
     Args:
         args (argparse.Namespace): parsed command line args.
@@ -449,13 +462,14 @@ def train_test(
         optimizer (torch.optim.Optimizer): optimizer to use.
         device (torch.device): device to use.
         train_dataloader (DataLoader): Training set's dataloader.
+        val_dataloader (DataLoader): Validation set's dataloader.
         test_dataloader (DataLoader): Test set's dataloader.
         lr_scheduler (LRPolicyScheduler): Learning rate scheduler.
 
     Returns:
-        TrainTestResults.
+        TrainValTestResults.
     """
-    results = TrainTestResults()
+    results = TrainValTestResults()
     pipeline = TrainPipelineSparseDist(
         model, optimizer, device, execute_all_batches=True
     )
@@ -464,16 +478,21 @@ def train_test(
         _train(
             pipeline,
             train_dataloader,
+            val_dataloader,
             epoch,
             lr_scheduler,
             args.print_lr,
+            args.validation_freq_within_epoch,
             args.limit_train_batches,
+            args.limit_val_batches,
         )
+        val_auroc = _evaluate(args.limit_val_batches, pipeline, val_dataloader, "val")
+        results.val_aurocs.append(val_auroc)
 
     test_auroc = _evaluate(args.limit_test_batches, pipeline, test_dataloader, "test")
     results.test_auroc = test_auroc
 
-    return results 
+    return results
 
 
 def main(argv: List[str]) -> None:
@@ -551,6 +570,7 @@ def main(argv: List[str]) -> None:
                 setattr(args, attr, 10)
 
     train_dataloader = get_dataloader(args, backend, "train")
+    val_dataloader = get_dataloader(args, backend, "val")
     test_dataloader = get_dataloader(args, backend, "test")
 
     eb_configs = [
@@ -669,12 +689,13 @@ def main(argv: List[str]) -> None:
         optimizer, args.lr_warmup_steps, args.lr_decay_start, args.lr_decay_steps
     )
 
-    train_test(
+    train_val_test(
         args,
         model,
         optimizer,
         device,
         train_dataloader,
+        val_dataloader,
         test_dataloader,
         lr_scheduler,
     )
