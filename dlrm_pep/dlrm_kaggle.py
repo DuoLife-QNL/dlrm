@@ -370,6 +370,21 @@ def batched(it: Iterator, n: int):
     for x in it:
         yield itertools.chain((x,), itertools.islice(it, n - 1))
 
+def print_dense_params_sum(model):
+    """
+    打印dense侧参数的总和
+    """
+    # dense arch参数和
+    dense_sum = sum(param.sum().item() for param in model.dense_arch.model.parameters())
+    
+    # over arch参数和
+    over_sum = sum(param.sum().item() for param in model.over_arch.model.parameters())
+    
+    if dist.get_rank() == 0:  # 只在主进程打印
+        print(f"\nDense arch parameters sum: {dense_sum:.6f}")
+        print(f"Over arch parameters sum: {over_sum:.6f}")
+        print(f"Total dense side parameters sum: {dense_sum + over_sum:.6f}")
+
 
 def _train(
     pipeline: TrainPipelineSparseDist,
@@ -420,6 +435,9 @@ def _train(
     )
     for batched_iterator in batched(iterator, n):
         for it in itertools.count(start_it):
+            # if is_rank_zero:
+                # print(f"\nStep {it}")
+                # print_dense_params_sum(pipeline._model.module.model)
             try:
                 if is_rank_zero and print_lr:
                     for i, g in enumerate(pipeline._optimizer.param_groups):
