@@ -5,18 +5,20 @@
 # LICENSE file in the root directory of this source tree.
 
 import argparse
+from dataclasses import dataclass, field
+from enum import Enum
 import itertools
 import os
 import sys
-from dataclasses import dataclass, field
-from enum import Enum
 from typing import Iterator, List, Optional
 
-import torch
-import torchmetrics as metrics
 from pyre_extensions import none_throws
+import torch
 from torch import distributed as dist
 from torch.utils.data import DataLoader
+import torchmetrics as metrics
+from tqdm import tqdm
+
 from torchrec import EmbeddingBagCollection
 from torchrec.datasets.criteo import DEFAULT_CAT_NAMES, DEFAULT_INT_NAMES
 from torchrec.distributed import TrainPipelineSparseDist
@@ -29,12 +31,11 @@ from torchrec.distributed.planner import EmbeddingShardingPlanner, Topology
 from torchrec.distributed.planner.storage_reservations import (
     HeuristicalStorageReservation,
 )
-from torchrec.models.dlrm import DLRM, DLRM_DCN, DLRM_Projection, DLRMTrain
+from torchrec.models.dlrm import DLRM, DLRMTrain, DLRM_DCN, DLRM_Projection
 from torchrec.modules.embedding_configs import EmbeddingBagConfig
 from torchrec.optim.apply_optimizer_in_backward import apply_optimizer_in_backward
 from torchrec.optim.keyed import CombinedOptimizer, KeyedOptimizerWrapper
 from torchrec.optim.optimizers import in_backward_optimizer_filter
-from tqdm import tqdm
 
 # OSS import
 try:
@@ -59,6 +60,17 @@ try:
     from .multi_hot import Multihot, RestartableMap  # noqa F811
 except ImportError:
     pass
+
+# Sketch embedding imports
+try:
+    from cafe.sketch_embedding_bag import SKEmbeddingBag
+    from cafe.sketch_embedding_collection import SketchEmbeddingBagCollection
+    from cafe.sketch_embedding_config import SketchEmbeddingBagConfig
+except ImportError:
+    # Fallback if sketch embedding is not available
+    SKEmbeddingBag = None
+    SketchEmbeddingBagCollection = None
+    SketchEmbeddingBagConfig = None
 
 TRAIN_PIPELINE_STAGES = 3  # Number of stages in TrainPipelineSparseDist.
 
@@ -308,6 +320,50 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
         action="store_true",
         help="Print the sharding plan used for each embedding table.",
     )
+    
+    # Sketch embedding arguments
+    parser.add_argument(
+        "--use_sketch_embedding",
+        action="store_true",
+        help="Use sketch-based embedding compression instead of standard embedding bags.",
+    )
+    parser.add_argument(
+        "--sketch_hot_size_ratio",
+        type=float,
+        default=0.1,
+        help="Ratio of hot table size to total embeddings for sketch embedding.",
+    )
+    parser.add_argument(
+        "--sketch_hash_size_ratio", 
+        type=float,
+        default=0.3,
+        help="Ratio of hash table size to total embeddings for sketch embedding.",
+    )
+    parser.add_argument(
+        "--sketch_threshold",
+        type=int,
+        default=1,
+        help="Sketch threshold parameter for sketch embedding.",
+    )
+    parser.add_argument(
+        "--sketch_alpha",
+        type=float,
+        default=1.0000005,
+        help="Sketch alpha parameter for sketch embedding.",
+    )
+    parser.add_argument(
+        "--sketch_adjust_threshold",
+        type=float,
+        default=0.5,
+        help="Sketch adjust threshold parameter for sketch embedding.",
+    )
+    parser.add_argument(
+        "--sketch_use_cpp",
+        action="store_true",
+        default=True,
+        help="Use C++ acceleration for sketch operations.",
+    )
+    
     return parser.parse_args(argv)
 
 
@@ -336,7 +392,12 @@ def _evaluate(
 
     auroc = metrics.AUROC(task="binary").to(device)
 
-    is_rank_zero = dist.get_rank() == 0
+    # Handle distributed vs single process mode
+    if "LOCAL_RANK" in os.environ:
+        is_rank_zero = dist.get_rank() == 0
+    else:
+        is_rank_zero = True  # Single process mode
+    
     if is_rank_zero:
         pbar = tqdm(
             iter(int, 1),
@@ -357,7 +418,11 @@ def _evaluate(
 
     auroc_result = auroc.compute().item()
     num_samples = torch.tensor(sum(map(len, auroc.target)), device=device)
-    dist.reduce(num_samples, 0, op=dist.ReduceOp.SUM)
+    
+    # Handle distributed vs single process mode
+    if "LOCAL_RANK" in os.environ:
+        dist.reduce(num_samples, 0, op=dist.ReduceOp.SUM)
+    # In single process mode, num_samples is already correct
 
     if is_rank_zero:
         print(f"AUROC over {stage} set: {auroc_result}.")
@@ -380,7 +445,13 @@ def print_dense_params_sum(model):
     # over arch参数和
     over_sum = sum(param.sum().item() for param in model.over_arch.model.parameters())
     
-    if dist.get_rank() == 0:  # 只在主进程打印
+    # Handle distributed vs single process mode
+    if "LOCAL_RANK" in os.environ:
+        is_rank_zero = dist.get_rank() == 0
+    else:
+        is_rank_zero = True  # Single process mode
+    
+    if is_rank_zero:  # 只在主进程打印
         print(f"\nDense arch parameters sum: {dense_sum:.6f}")
         print(f"Over arch parameters sum: {over_sum:.6f}")
         print(f"Total dense side parameters sum: {dense_sum + over_sum:.6f}")
@@ -418,7 +489,12 @@ def _train(
 
     iterator = itertools.islice(iter(train_dataloader), limit_train_batches)
 
-    is_rank_zero = dist.get_rank() == 0
+    # Handle distributed vs single process mode
+    if "LOCAL_RANK" in os.environ:
+        is_rank_zero = dist.get_rank() == 0
+    else:
+        is_rank_zero = True  # Single process mode
+    
     if is_rank_zero:
         pbar = tqdm(
             iter(int, 1),
@@ -512,7 +588,6 @@ def train_val_test(
 
     return results
 
-
 def main(argv: List[str]) -> None:
     """
     Trains, validates, and tests a Deep Learning Recommendation Model (DLRM)
@@ -557,7 +632,7 @@ def main(argv: List[str]) -> None:
         or args.synthetic_multi_hot_criteo_path is None
     ), "--multi_hot_distribution_type is used to convert 1-hot to multi-hot. It's inapplicable with --synthetic_multi_hot_criteo_path."
 
-    rank = int(os.environ["LOCAL_RANK"])
+    rank = int(os.environ.get("LOCAL_RANK", "0"))
     if torch.cuda.is_available():
         device = torch.device(f"cuda:{rank}")
         backend = "nccl"
@@ -571,7 +646,14 @@ def main(argv: List[str]) -> None:
             "PARAMS: (lr, batch_size, warmup_steps, decay_start, decay_steps): "
             f"{(args.learning_rate, args.batch_size, args.lr_warmup_steps, args.lr_decay_start, args.lr_decay_steps)}"
         )
-    dist.init_process_group(backend=backend)
+    
+    # Initialize process group only if distributed training is enabled
+    if "LOCAL_RANK" in os.environ:
+        dist.init_process_group(backend=backend)
+    else:
+        # Single process mode - create a dummy process group
+        if rank == 0:
+            print("Running in single process mode")
 
     if args.num_embeddings_per_feature is not None:
         args.num_embeddings = None
@@ -591,28 +673,79 @@ def main(argv: List[str]) -> None:
     val_dataloader = get_dataloader(args, backend, "val")
     test_dataloader = get_dataloader(args, backend, "test")
 
-    eb_configs = [
-        EmbeddingBagConfig(
-            name=f"t_{feature_name}",
-            embedding_dim=args.embedding_dim,
-            num_embeddings=(
-                none_throws(args.num_embeddings_per_feature)[feature_idx]
-                if args.num_embeddings is None
-                else args.num_embeddings
-            ),
-            feature_names=[feature_name],
-        )
-        for feature_idx, feature_name in enumerate(DEFAULT_CAT_NAMES)
-    ]
+    def create_embedding_collection(args, device):
+        """Create embedding collection based on whether sketch embedding is enabled."""
+        if args.use_sketch_embedding:
+            if SketchEmbeddingBagCollection is None:
+                raise ImportError("Sketch embedding is not available. Please install the sketch embedding module.")
+
+            if (SketchEmbeddingBagConfig is None):
+                raise ImportError("Sketch embedding is not available. Please install the sketch embedding module.")
+            
+            # Create sketch embedding configs
+            sketch_configs = []
+            for feature_idx, feature_name in enumerate(DEFAULT_CAT_NAMES):
+                num_embeddings = (
+                    none_throws(args.num_embeddings_per_feature)[feature_idx]
+                    if args.num_embeddings is None
+                    else args.num_embeddings
+                )
+                hot_size = int(num_embeddings * args.sketch_hot_size_ratio)
+                hash_size = int(num_embeddings * args.sketch_hash_size_ratio)
+
+                config = SketchEmbeddingBagConfig(
+                    name=f"t_{feature_name}",
+                    embedding_dim=args.embedding_dim,
+                    num_embeddings=num_embeddings,
+                    feature_names=[feature_name],
+                    hot_size=hot_size,
+                    hash_size=hash_size,
+                    sketch_threshold=args.sketch_threshold,
+                    sketch_alpha=args.sketch_alpha,
+                    adjust_threshold=args.sketch_adjust_threshold,
+                )
+                sketch_configs.append(config)
+            
+            if rank == 0:
+                print(f"Using sketch embedding with {len(sketch_configs)} tables")
+                print(f"Sketch parameters: hot_ratio={args.sketch_hot_size_ratio}, hash_ratio={args.sketch_hash_size_ratio}")
+                print(f"Sketch config: threshold={args.sketch_threshold}, alpha={args.sketch_alpha}")
+            
+            return SketchEmbeddingBagCollection(
+                tables=sketch_configs,
+                device=device,
+                use_cpp=args.sketch_use_cpp,
+            )
+        else:
+            # Use standard embedding bag configs
+            eb_configs = [
+                EmbeddingBagConfig(
+                    name=f"t_{feature_name}",
+                    embedding_dim=args.embedding_dim,
+                    num_embeddings=(
+                        none_throws(args.num_embeddings_per_feature)[feature_idx]
+                        if args.num_embeddings is None
+                        else args.num_embeddings
+                    ),
+                    feature_names=[feature_name],
+                )
+                for feature_idx, feature_name in enumerate(DEFAULT_CAT_NAMES)
+            ]
+            return EmbeddingBagCollection(
+                tables=eb_configs, 
+                device=torch.device("meta")
+            )
+
+    # Create embedding collection
+    embedding_collection = create_embedding_collection(args, device)
+    
     sharded_module_kwargs = {}
     if args.over_arch_layer_sizes is not None:
         sharded_module_kwargs["over_arch_layer_sizes"] = args.over_arch_layer_sizes
 
     if args.interaction_type == InteractionType.ORIGINAL:
         dlrm_model = DLRM(
-            embedding_bag_collection=EmbeddingBagCollection(
-                tables=eb_configs, device=torch.device("meta")
-            ),
+            embedding_bag_collection=embedding_collection,
             dense_in_features=len(DEFAULT_INT_NAMES),
             dense_arch_layer_sizes=args.dense_arch_layer_sizes,
             over_arch_layer_sizes=args.over_arch_layer_sizes,
@@ -620,9 +753,7 @@ def main(argv: List[str]) -> None:
         )
     elif args.interaction_type == InteractionType.DCN:
         dlrm_model = DLRM_DCN(
-            embedding_bag_collection=EmbeddingBagCollection(
-                tables=eb_configs, device=torch.device("meta")
-            ),
+            embedding_bag_collection=embedding_collection,
             dense_in_features=len(DEFAULT_INT_NAMES),
             dense_arch_layer_sizes=args.dense_arch_layer_sizes,
             over_arch_layer_sizes=args.over_arch_layer_sizes,
@@ -632,9 +763,7 @@ def main(argv: List[str]) -> None:
         )
     elif args.interaction_type == InteractionType.PROJECTION:
         dlrm_model = DLRM_Projection(
-            embedding_bag_collection=EmbeddingBagCollection(
-                tables=eb_configs, device=torch.device("meta")
-            ),
+            embedding_bag_collection=embedding_collection,
             dense_in_features=len(DEFAULT_INT_NAMES),
             dense_arch_layer_sizes=args.dense_arch_layer_sizes,
             over_arch_layer_sizes=args.over_arch_layer_sizes,
@@ -659,31 +788,49 @@ def main(argv: List[str]) -> None:
     optimizer_kwargs = {"lr": args.learning_rate}
     if args.adagrad:
         optimizer_kwargs["eps"] = args.eps
-    apply_optimizer_in_backward(
-        embedding_optimizer,
-        train_model.model.sparse_arch.parameters(),
-        optimizer_kwargs,
-    )
-    planner = EmbeddingShardingPlanner(
-        topology=Topology(
-            local_world_size=get_local_size(),
-            world_size=dist.get_world_size(),
-            compute_device=device.type,
-        ),
-        batch_size=args.batch_size,
-        # If experience OOM, increase the percentage. see
-        # https://pytorch.org/torchrec/torchrec.distributed.planner.html#torchrec.distributed.planner.storage_reservations.HeuristicalStorageReservation
-        storage_reservation=HeuristicalStorageReservation(percentage=0.05),
-    )
-    plan = planner.collective_plan(
-        train_model, get_default_sharders(), dist.GroupMember.WORLD
-    )
+    
+    # Apply optimizer to embedding parameters
+    if args.use_sketch_embedding:
+        # For sketch embedding, we need to handle the parameters differently
+        # since sketch embedding has its own parameter structure
+        if rank == 0:
+            print("Applying optimizer to sketch embedding parameters...")
+        # Note: Sketch embedding parameters are handled internally by the sketch embedding module
+        # We don't need to apply optimizer_in_backward for sketch embedding
+    else:
+        # Standard embedding bag optimization
+        apply_optimizer_in_backward(
+            embedding_optimizer,
+            train_model.model.sparse_arch.parameters(),
+            optimizer_kwargs,
+        )
+    
+    # Handle distributed vs single process mode
+    if "LOCAL_RANK" in os.environ:
+        # Distributed mode
+        planner = EmbeddingShardingPlanner(
+            topology=Topology(
+                local_world_size=get_local_size(),
+                world_size=dist.get_world_size(),
+                compute_device=device.type,
+            ),
+            batch_size=args.batch_size,
+            storage_reservation=HeuristicalStorageReservation(percentage=0.05),
+        )
+        plan = planner.collective_plan(
+            train_model, get_default_sharders(), dist.GroupMember.WORLD
+        )
+        model = DistributedModelParallel(
+            module=train_model,
+            device=device,
+            plan=plan,
+        )
+    else:
+        # Single process mode - use the model directly
+        if rank == 0:
+            print("Using single process mode - no distributed model parallel")
+        model = train_model
 
-    model = DistributedModelParallel(
-        module=train_model,
-        device=device,
-        plan=plan,
-    )
     if rank == 0 and args.print_sharding_plan:
         for collectionkey, plans in model._plan.plan.items():
             print(collectionkey)
@@ -698,11 +845,25 @@ def main(argv: List[str]) -> None:
         else:
             return lambda params: torch.optim.SGD(params, lr=args.learning_rate)
 
-    dense_optimizer = KeyedOptimizerWrapper(
-        dict(in_backward_optimizer_filter(model.named_parameters())),
-        optimizer_with_params(),
-    )
-    optimizer = CombinedOptimizer([model.fused_optimizer, dense_optimizer])
+    if args.use_sketch_embedding:
+        # 单卡/非分布式下，sketch embedding 直接用一个普通的 PyTorch 优化器管理所有参数
+        if rank == 0:
+            print("[Sketch Embedding] Using simple optimizer for all parameters (single process mode)")
+        optimizer = optimizer_with_params()(model.parameters())
+    else:
+        # Standard optimization for regular embedding bags
+        if "LOCAL_RANK" in os.environ:
+            # Distributed mode
+            dense_optimizer = KeyedOptimizerWrapper(
+                dict(in_backward_optimizer_filter(model.named_parameters())),
+                optimizer_with_params(),
+            )
+            optimizer = CombinedOptimizer([model.fused_optimizer, dense_optimizer])
+        else:
+            # Single process mode - create a simple optimizer
+            if rank == 0:
+                print("Creating simple optimizer for single process mode")
+            optimizer = optimizer_with_params()(model.parameters())
     lr_scheduler = LRPolicyScheduler(
         optimizer, args.lr_warmup_steps, args.lr_decay_start, args.lr_decay_steps
     )
